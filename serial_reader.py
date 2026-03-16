@@ -1,17 +1,25 @@
+import argparse
+
 import serial
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Simple serial monitor for sensor values")
+    parser.add_argument("--port", required=True, help="Serial port (e.g., COM8 or /dev/ttyUSB0)")
+    parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default: 9600)")
+    return parser.parse_args()
+
+
 def main():
-    port_name = "COM8"
-    baud_rate = 9600
+    args = parse_args()
 
     try:
-        ser = serial.Serial(port_name, baudrate=baud_rate, timeout=0.1)
+        ser = serial.Serial(args.port, baudrate=args.baud, timeout=0.1)
     except Exception as exc:
         print(f"Failed to open port: {exc}")
         return
 
-    print("Port opened. Listening...")
+    print(f"Port opened on {args.port} @ {args.baud}. Listening...")
 
     try:
         while True:

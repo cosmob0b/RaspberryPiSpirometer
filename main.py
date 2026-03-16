@@ -1,3 +1,4 @@
+import argparse
 import threading
 import time
 import tkinter as tk
@@ -81,6 +82,98 @@ class GameHistory:
         return "\n".join(lines)
 
 
+class SerialInputInterpreter:
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.sensor_active = False
+
+    def parse(self, raw_line):
+        line = raw_line.strip()
+        if line in {"A_PRESSED", "B_PRESSED", "A_RELEASED", "B_RELEASED"}:
+            return line
+
+        normalized = line
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if key.strip().lower() in {"sensor", "pressure", "value", "reading"}:
+                normalized = value.strip()
+
+        try:
+            reading = float(normalized)
+        except ValueError:
+            return None
+
+        if reading >= self.threshold and not self.sensor_active:
+            self.sensor_active = True
+            return "SENSOR_PRESSED"
+
+        if reading < self.threshold and self.sensor_active:
+            self.sensor_active = False
+            return "SENSOR_RELEASED"
+
+        return None
+
+
+class YFS201CGPIOReader:
+    """Reads YF-S201C flow pulses from a GPIO pin and turns flow on/off into game events."""
+
+    def __init__(self, gpio_pin, flow_threshold_lpm):
+        self.gpio_pin = gpio_pin
+        self.flow_threshold_lpm = flow_threshold_lpm
+        self.pulse_count = 0
+        self._lock = threading.Lock()
+        self.sensor_active = False
+        self._gpio = None
+
+    def _pulse_callback(self, _channel):
+        with self._lock:
+            self.pulse_count += 1
+
+    def start(self):
+        try:
+            import RPi.GPIO as GPIO  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "RPi.GPIO is required for --input-mode gpio. Install on Raspberry Pi: sudo apt install python3-rpi.gpio"
+            ) from exc
+
+        self._gpio = GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(self.gpio_pin, GPIO.FALLING, callback=self._pulse_callback)
+
+    def stop(self):
+        if self._gpio is not None:
+            try:
+                self._gpio.remove_event_detect(self.gpio_pin)
+            except Exception:
+                pass
+            self._gpio.cleanup(self.gpio_pin)
+            self._gpio = None
+
+    def read_event(self, sample_seconds=0.5):
+        time.sleep(sample_seconds)
+
+        with self._lock:
+            pulses = self.pulse_count
+            self.pulse_count = 0
+
+        frequency_hz = pulses / sample_seconds
+        flow_lpm = max((frequency_hz + 3.0) / 5.0, 0.0)
+        print(f"GPIO pulse sample: {pulses} pulses/{sample_seconds:.2f}s -> {flow_lpm:.2f} L/min")
+
+        if flow_lpm >= self.flow_threshold_lpm and not self.sensor_active:
+            self.sensor_active = True
+            return "SENSOR_PRESSED"
+
+        if flow_lpm < self.flow_threshold_lpm and self.sensor_active:
+            self.sensor_active = False
+            return "SENSOR_RELEASED"
+
+        return None
+
+
 class BalloonCanvas(tk.Canvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, highlightthickness=0, **kwargs)
@@ -111,12 +204,28 @@ class BalloonCanvas(tk.Canvas):
 
 
 class MainApp(tk.Tk):
-    def __init__(self):
+    def __init__(
+        self,
+        input_mode="serial",
+        serial_port=None,
+        baud_rate=9600,
+        serial_threshold=0.5,
+        gpio_pin=17,
+        flow_threshold_lpm=1.0,
+    ):
         super().__init__()
         self.title("My Game Menu")
         self.geometry("460x460")
         self.resizable(False, False)
         self.current_frame = None
+
+        self.input_mode = input_mode
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.serial_threshold = serial_threshold
+        self.gpio_pin = gpio_pin
+        self.flow_threshold_lpm = flow_threshold_lpm
+
         self.show_main_menu()
 
     def show_frame(self, frame_cls):
@@ -169,18 +278,21 @@ class BeginGameFrame(tk.Frame):
         self.app = app
         self.running = True
         self.port = None
+        self.gpio_reader = None
         self.holding_button = False
         self.current_hold_score = 0
         self.last_tick = time.monotonic()
         self.hold_after_id = None
+        self.interpreter = SerialInputInterpreter(app.serial_threshold)
 
         base_font = AppSettings.get_base_font_size()
         fg = AppSettings.get_foreground_color()
         bg = AppSettings.get_background_color()
 
+        sensor_hint = "A/B serial" if app.input_mode == "serial" else f"YF-S201C on GPIO {app.gpio_pin}"
         self.status_label = tk.Label(
             self,
-            text="Press and hold A or B on the board!",
+            text=f"Input mode: {app.input_mode} ({sensor_hint})",
             font=("Arial", base_font, "bold"),
             fg=fg,
             bg=bg,
@@ -196,28 +308,55 @@ class BeginGameFrame(tk.Frame):
         back_button = tk.Button(self, text="Back to Menu", font=("Arial", max(base_font - 2, 10)), command=self.back_to_menu)
         back_button.pack(pady=(0, 16))
 
-        self.start_serial_listener()
+        self.start_input_listener()
 
     def destroy(self):
         self.running = False
         self.stop_hold_timer()
-        self.close_port()
+        self.close_inputs()
         super().destroy()
 
     def back_to_menu(self):
         self.running = False
         self.stop_hold_timer()
-        self.close_port()
+        self.close_inputs()
         self.app.show_main_menu()
 
-    def start_serial_listener(self):
-        thread = threading.Thread(target=self.serial_loop, name="CPX-Serial-Listener", daemon=True)
+    def start_input_listener(self):
+        thread = threading.Thread(target=self.input_loop, name="Input-Listener", daemon=True)
         thread.start()
 
-    def serial_loop(self):
+    def input_loop(self):
         try:
+            if self.app.input_mode == "gpio":
+                self.gpio_loop()
+            else:
+                self.serial_loop()
+        except Exception as exc:
+            print(f"Input listener error: {exc}")
+            self.app.after(0, lambda: self.status_label.configure(text=f"Input error: {exc}"))
+        finally:
+            self.close_inputs()
+
+    def gpio_loop(self):
+        self.gpio_reader = YFS201CGPIOReader(self.app.gpio_pin, self.app.flow_threshold_lpm)
+        self.gpio_reader.start()
+
+        msg = f"Reading YF-S201C on GPIO {self.app.gpio_pin} (threshold: {self.app.flow_threshold_lpm:.2f} L/min)"
+        print(msg)
+        self.app.after(0, lambda: self.status_label.configure(text=msg))
+
+        while self.running:
+            event = self.gpio_reader.read_event(sample_seconds=0.5)
+            if event:
+                self.app.after(0, self.handle_input_event, event)
+
+    def serial_loop(self):
+        candidate_device = self.app.serial_port
+        if candidate_device is None:
             ports = list(serial.tools.list_ports.comports())
             if not ports:
+                self.app.after(0, lambda: self.status_label.configure(text="No serial ports found."))
                 print("No serial ports found.")
                 return
 
@@ -227,38 +366,40 @@ class BeginGameFrame(tk.Frame):
                 desc = p.description or ""
                 print(f"Found port: {name} - {desc}")
                 lower = f"{desc} {name}".lower()
-                if "com1" not in name.lower() and any(x in lower for x in ("usb", "circuit", "playground")):
+                if "com1" not in name.lower() and any(x in lower for x in ("usb", "circuit", "playground", "ttyacm", "ttyusb")):
                     candidate = p
                     break
 
             if candidate is None:
                 candidate = ports[-1]
-                print(f"No specific CPX match found, falling back to: {candidate.device}")
+                print(f"No specific device match found, falling back to: {candidate.device}")
+            candidate_device = candidate.device
 
-            print(f"Trying to open: {candidate.device}")
-            self.port = serial.Serial(candidate.device, baudrate=9600, timeout=0.1)
-            print(f"Serial connected on {candidate.device} (game).")
+        print(f"Trying to open: {candidate_device}")
+        self.port = serial.Serial(candidate_device, baudrate=self.app.baud_rate, timeout=0.1)
+        print(f"Serial connected on {candidate_device} (game).")
 
-            while self.running and self.port and self.port.is_open:
-                raw = self.port.readline()
-                if not raw:
-                    continue
-                line = raw.decode(errors="ignore").strip()
-                if line:
-                    print(f"Serial: {line}")
-                    self.app.after(0, self.handle_serial_line, line)
-        except Exception as exc:
-            print(f"Serial listener error: {exc}")
-        finally:
-            self.close_port()
+        while self.running and self.port and self.port.is_open:
+            raw = self.port.readline()
+            if not raw:
+                continue
 
-    def handle_serial_line(self, line):
-        if line == "A_PRESSED":
-            self.handle_button_pressed("A", "#2e7d32")
+            line = raw.decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            print(f"Serial: {line}")
+            event = self.interpreter.parse(line)
+            if event:
+                self.app.after(0, self.handle_input_event, event)
+
+    def handle_input_event(self, line):
+        if line in {"A_PRESSED", "SENSOR_PRESSED"}:
+            self.handle_button_pressed("SENSOR", "#2e7d32")
         elif line == "B_PRESSED":
             self.handle_button_pressed("B", "#c62828")
-        elif line == "A_RELEASED":
-            self.handle_button_released("A")
+        elif line in {"A_RELEASED", "SENSOR_RELEASED"}:
+            self.handle_button_released("SENSOR")
         elif line == "B_RELEASED":
             self.handle_button_released("B")
 
@@ -284,7 +425,7 @@ class BeginGameFrame(tk.Frame):
             GameHistory.add_score(self.current_hold_score)
             self.status_label.configure(text=f"Released {button_name}! Score recorded.")
         else:
-            self.status_label.configure(text="Press and hold A or B on the board!")
+            self.status_label.configure(text="Waiting for sensor input...")
 
         bg = AppSettings.get_background_color()
         self.configure(bg=bg)
@@ -323,10 +464,14 @@ class BeginGameFrame(tk.Frame):
     def update_score_label(self):
         self.score_label.configure(text=f"Hold Score: {self.current_hold_score}")
 
-    def close_port(self):
+    def close_inputs(self):
         if self.port and self.port.is_open:
             self.port.close()
             print("Serial port closed.")
+
+        if self.gpio_reader is not None:
+            self.gpio_reader.stop()
+            self.gpio_reader = None
 
 
 class HistoryFrame(tk.Frame):
@@ -436,6 +581,43 @@ class SettingsFrame(tk.Frame):
         self.sound_check.configure(bg=bg, fg=fg, selectcolor=bg)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Balloon game with serial or GPIO sensor input")
+    parser.add_argument(
+        "--input-mode",
+        choices=["serial", "gpio"],
+        default="serial",
+        help="Input source. Use gpio for YF-S201C directly on Raspberry Pi pins.",
+    )
+
+    parser.add_argument("--port", help="Serial port (e.g., COM8, /dev/ttyUSB0). If omitted, auto-detect is used.")
+    parser.add_argument("--baud", type=int, default=9600, help="Serial baud rate. Default: 9600")
+    parser.add_argument(
+        "--sensor-threshold",
+        type=float,
+        default=0.5,
+        help="Numeric reading threshold for serial numeric mode. Default: 0.5",
+    )
+
+    parser.add_argument("--gpio-pin", type=int, default=17, help="BCM GPIO pin for YF-S201C pulse output. Default: 17")
+    parser.add_argument(
+        "--flow-threshold-lpm",
+        type=float,
+        default=1.0,
+        help="Start/stop game hold when flow crosses this L/min threshold. Default: 1.0",
+    )
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    app = MainApp()
+    args = parse_args()
+    app = MainApp(
+        input_mode=args.input_mode,
+        serial_port=args.port,
+        baud_rate=args.baud,
+        serial_threshold=args.sensor_threshold,
+        gpio_pin=args.gpio_pin,
+        flow_threshold_lpm=args.flow_threshold_lpm,
+    )
     app.mainloop()
