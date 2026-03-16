@@ -1,10 +1,8 @@
+import argparse
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
-
-import serial
-import serial.tools.list_ports
 
 
 class AppSettings:
@@ -74,11 +72,59 @@ class GameHistory:
     @classmethod
     def format_scores(cls):
         if not cls.scores:
-            return "No scores recorded yet.\nHold a button to start scoring!"
+            return "No scores recorded yet.\nRun water through the sensor to animate the balloon!"
         lines = []
         for i, score in enumerate(cls.scores, start=1):
             lines.append(f"#{i}: {score} points")
         return "\n".join(lines)
+
+
+class YFS201CGPIOReader:
+    """Read YF-S201C pulse output on a Raspberry Pi GPIO pin."""
+
+    def __init__(self, gpio_pin):
+        self.gpio_pin = gpio_pin
+        self.pulse_count = 0
+        self._lock = threading.Lock()
+        self._gpio = None
+
+    def _pulse_callback(self, _channel):
+        with self._lock:
+            self.pulse_count += 1
+
+    def start(self):
+        try:
+            import RPi.GPIO as GPIO  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "RPi.GPIO is required. Install on Raspberry Pi with: sudo apt install python3-rpi.gpio"
+            ) from exc
+
+        self._gpio = GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(self.gpio_pin, GPIO.FALLING, callback=self._pulse_callback)
+
+    def stop(self):
+        if self._gpio is not None:
+            try:
+                self._gpio.remove_event_detect(self.gpio_pin)
+            except Exception:
+                pass
+            self._gpio.cleanup(self.gpio_pin)
+            self._gpio = None
+
+    def read_flow_lpm(self, sample_seconds=0.5):
+        time.sleep(sample_seconds)
+
+        with self._lock:
+            pulses = self.pulse_count
+            self.pulse_count = 0
+
+        frequency_hz = pulses / sample_seconds
+        flow_lpm = max((frequency_hz + 3.0) / 5.0, 0.0)
+        return flow_lpm
 
 
 class BalloonCanvas(tk.Canvas):
@@ -111,12 +157,16 @@ class BalloonCanvas(tk.Canvas):
 
 
 class MainApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, gpio_pin=17, sample_window=0.5):
         super().__init__()
         self.title("My Game Menu")
         self.geometry("460x460")
         self.resizable(False, False)
         self.current_frame = None
+
+        self.gpio_pin = gpio_pin
+        self.sample_window = sample_window
+
         self.show_main_menu()
 
     def show_frame(self, frame_cls):
@@ -168,11 +218,10 @@ class BeginGameFrame(tk.Frame):
         super().__init__(app, bg=AppSettings.get_background_color())
         self.app = app
         self.running = True
-        self.port = None
-        self.holding_button = False
-        self.current_hold_score = 0
-        self.last_tick = time.monotonic()
-        self.hold_after_id = None
+        self.gpio_reader = None
+
+        self.last_flow_lpm = None
+        self.inflation_level = 0.0
 
         base_font = AppSettings.get_base_font_size()
         fg = AppSettings.get_foreground_color()
@@ -180,7 +229,7 @@ class BeginGameFrame(tk.Frame):
 
         self.status_label = tk.Label(
             self,
-            text="Press and hold A or B on the board!",
+            text=f"YF-S201C on BCM GPIO {app.gpio_pin}",
             font=("Arial", base_font, "bold"),
             fg=fg,
             bg=bg,
@@ -190,143 +239,68 @@ class BeginGameFrame(tk.Frame):
         self.balloon = BalloonCanvas(self, bg=bg)
         self.balloon.pack(fill="both", expand=True, padx=16, pady=8)
 
-        self.score_label = tk.Label(self, text="Hold Score: 0", font=("Arial", max(base_font - 2, 10)), fg=fg, bg=bg)
+        self.score_label = tk.Label(self, text="Flow: 0.00 L/min", font=("Arial", max(base_font - 2, 10)), fg=fg, bg=bg)
         self.score_label.pack(pady=8)
 
         back_button = tk.Button(self, text="Back to Menu", font=("Arial", max(base_font - 2, 10)), command=self.back_to_menu)
         back_button.pack(pady=(0, 16))
 
-        self.start_serial_listener()
+        self.start_gpio_listener()
 
     def destroy(self):
         self.running = False
-        self.stop_hold_timer()
-        self.close_port()
+        self.close_inputs()
         super().destroy()
 
     def back_to_menu(self):
         self.running = False
-        self.stop_hold_timer()
-        self.close_port()
+        self.close_inputs()
         self.app.show_main_menu()
 
-    def start_serial_listener(self):
-        thread = threading.Thread(target=self.serial_loop, name="CPX-Serial-Listener", daemon=True)
+    def start_gpio_listener(self):
+        thread = threading.Thread(target=self.gpio_loop, name="YFS201C-Listener", daemon=True)
         thread.start()
 
-    def serial_loop(self):
+    def gpio_loop(self):
         try:
-            ports = list(serial.tools.list_ports.comports())
-            if not ports:
-                print("No serial ports found.")
-                return
-
-            candidate = None
-            for p in ports:
-                name = p.device
-                desc = p.description or ""
-                print(f"Found port: {name} - {desc}")
-                lower = f"{desc} {name}".lower()
-                if "com1" not in name.lower() and any(x in lower for x in ("usb", "circuit", "playground")):
-                    candidate = p
-                    break
-
-            if candidate is None:
-                candidate = ports[-1]
-                print(f"No specific CPX match found, falling back to: {candidate.device}")
-
-            print(f"Trying to open: {candidate.device}")
-            self.port = serial.Serial(candidate.device, baudrate=9600, timeout=0.1)
-            print(f"Serial connected on {candidate.device} (game).")
-
-            while self.running and self.port and self.port.is_open:
-                raw = self.port.readline()
-                if not raw:
-                    continue
-                line = raw.decode(errors="ignore").strip()
-                if line:
-                    print(f"Serial: {line}")
-                    self.app.after(0, self.handle_serial_line, line)
+            self.gpio_reader = YFS201CGPIOReader(self.app.gpio_pin)
+            self.gpio_reader.start()
+            while self.running:
+                flow_lpm = self.gpio_reader.read_flow_lpm(sample_seconds=self.app.sample_window)
+                self.app.after(0, self.handle_flow_reading, flow_lpm)
         except Exception as exc:
-            print(f"Serial listener error: {exc}")
+            print(f"GPIO listener error: {exc}")
+            self.app.after(0, lambda: self.status_label.configure(text=f"GPIO error: {exc}"))
         finally:
-            self.close_port()
+            self.close_inputs()
 
-    def handle_serial_line(self, line):
-        if line == "A_PRESSED":
-            self.handle_button_pressed("A", "#2e7d32")
-        elif line == "B_PRESSED":
-            self.handle_button_pressed("B", "#c62828")
-        elif line == "A_RELEASED":
-            self.handle_button_released("A")
-        elif line == "B_RELEASED":
-            self.handle_button_released("B")
+    def handle_flow_reading(self, flow_lpm):
+        self.score_label.configure(text=f"Flow: {flow_lpm:.2f} L/min")
 
-    def handle_button_pressed(self, button_name, panel_color):
-        self.configure(bg=panel_color)
-        self.status_label.configure(bg=panel_color)
-        self.score_label.configure(bg=panel_color)
-        self.balloon.configure(bg=panel_color)
+        if self.last_flow_lpm is None:
+            self.last_flow_lpm = flow_lpm
+            return
 
-        if not self.holding_button:
-            self.holding_button = True
-            self.current_hold_score = 0
-            self.update_score_label()
-            self.status_label.configure(text=f"Holding {button_name}... keep going!")
-            self.balloon.set_inflation_level(0.0)
-            self.last_tick = time.monotonic()
-            self.schedule_hold_tick()
+        delta = flow_lpm - self.last_flow_lpm
 
-    def handle_button_released(self, button_name):
-        if self.holding_button:
-            self.holding_button = False
-            self.stop_hold_timer()
-            GameHistory.add_score(self.current_hold_score)
-            self.status_label.configure(text=f"Released {button_name}! Score recorded.")
+        if delta > 0.02:
+            step = min(0.12, 0.01 + (delta * 0.04))
+            self.inflation_level = min(1.0, self.inflation_level + step)
+            self.status_label.configure(text="Flow increasing → balloon inflating")
+        elif delta < -0.02:
+            step = min(0.12, 0.01 + (abs(delta) * 0.04))
+            self.inflation_level = max(0.0, self.inflation_level - step)
+            self.status_label.configure(text="Flow decreasing → balloon deflating")
         else:
-            self.status_label.configure(text="Press and hold A or B on the board!")
+            self.status_label.configure(text="Flow steady")
 
-        bg = AppSettings.get_background_color()
-        self.configure(bg=bg)
-        self.status_label.configure(bg=bg)
-        self.score_label.configure(bg=bg)
-        self.balloon.configure(bg=bg)
-        self.balloon.set_inflation_level(0.0)
+        self.balloon.set_inflation_level(self.inflation_level)
+        self.last_flow_lpm = flow_lpm
 
-    def schedule_hold_tick(self):
-        self.hold_after_id = self.app.after(50, self.update_hold_score)
-
-    def stop_hold_timer(self):
-        if self.hold_after_id is not None:
-            self.app.after_cancel(self.hold_after_id)
-            self.hold_after_id = None
-        self.holding_button = False
-
-    def update_hold_score(self):
-        now = time.monotonic()
-        delta_seconds = now - self.last_tick
-        self.last_tick = now
-
-        points = round(delta_seconds * 20)
-        if points < 1:
-            points = 1
-
-        self.current_hold_score += points
-        self.update_score_label()
-
-        normalized = min(self.current_hold_score / 200.0, 1.0)
-        self.balloon.set_inflation_level(normalized)
-
-        if self.holding_button:
-            self.schedule_hold_tick()
-
-    def update_score_label(self):
-        self.score_label.configure(text=f"Hold Score: {self.current_hold_score}")
-
-    def close_port(self):
-        if self.port and self.port.is_open:
-            self.port.close()
-            print("Serial port closed.")
+    def close_inputs(self):
+        if self.gpio_reader is not None:
+            self.gpio_reader.stop()
+            self.gpio_reader = None
 
 
 class HistoryFrame(tk.Frame):
@@ -436,6 +410,19 @@ class SettingsFrame(tk.Frame):
         self.sound_check.configure(bg=bg, fg=fg, selectcolor=bg)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Balloon game with YF-S201C GPIO flow input")
+    parser.add_argument("--gpio-pin", type=int, default=17, help="BCM GPIO pin for YF-S201C output (default: 17)")
+    parser.add_argument(
+        "--sample-window",
+        type=float,
+        default=0.5,
+        help="Seconds per flow sample. Lower is more responsive, higher is smoother (default: 0.5)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    app = MainApp()
+    args = parse_args()
+    app = MainApp(gpio_pin=args.gpio_pin, sample_window=args.sample_window)
     app.mainloop()
