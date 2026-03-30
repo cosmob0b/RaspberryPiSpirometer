@@ -160,14 +160,25 @@ class MainApp(tk.Tk):
     def __init__(self, gpio_pin=17, sample_window=0.5):
         super().__init__()
         self.title("My Game Menu")
-        self.geometry("460x460")
-        self.resizable(False, False)
+        self.set_window_size()
+        self.minsize(420, 420)
+        self.resizable(True, True)
         self.current_frame = None
 
         self.gpio_pin = gpio_pin
         self.sample_window = sample_window
 
         self.show_main_menu()
+
+    def set_window_size(self):
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+
+        width = min(max(int(screen_w * 0.8), 460), screen_w)
+        height = min(max(int(screen_h * 0.8), 460), screen_h)
+        x = max((screen_w - width) // 2, 0)
+        y = max((screen_h - height) // 2, 0)
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def show_frame(self, frame_cls):
         if self.current_frame is not None:
