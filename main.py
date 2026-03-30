@@ -390,7 +390,8 @@ class BalloonGameFrame(tk.Frame):
                 self.app.after(0, self.handle_flow_reading, flow_lpm)
         except Exception as exc:
             print(f"GPIO listener error: {exc}")
-            self.app.after(0, lambda: self.status_label.configure(text=f"GPIO error: {exc}"))
+            error_message = str(exc)
+            self.app.after(0, lambda: self.status_label.configure(text=f"GPIO error: {error_message}"))
         finally:
             self.close_inputs()
 
@@ -480,7 +481,8 @@ class ArduinoBalloonGameFrame(tk.Frame):
                 self.app.after(0, self.handle_flow_reading, flow_lpm)
         except Exception as exc:
             print(f"Serial listener error: {exc}")
-            self.app.after(0, lambda: self.status_label.configure(text=f"Serial error: {exc}"))
+            error_message = str(exc)
+            self.app.after(0, lambda: self.status_label.configure(text=f"Serial error: {error_message}"))
         finally:
             self.close_inputs()
 
