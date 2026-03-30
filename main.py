@@ -189,8 +189,11 @@ class MainApp(tk.Tk):
     def show_main_menu(self):
         self.show_frame(MainMenuFrame)
 
-    def show_game(self):
-        self.show_frame(BeginGameFrame)
+    def show_game_selection(self):
+        self.show_frame(GameSelectionFrame)
+
+    def show_balloon_game(self):
+        self.show_frame(BalloonGameFrame)
 
     def show_history(self):
         self.show_frame(HistoryFrame)
@@ -213,7 +216,7 @@ class MainMenuFrame(tk.Frame):
         button_wrap.pack(expand=True)
 
         buttons = [
-            ("Begin Game", app.show_game),
+            ("Begin Game", app.show_game_selection),
             ("Settings", app.show_settings),
             ("History & Data", app.show_history),
             ("Exit", app.destroy),
@@ -224,7 +227,47 @@ class MainMenuFrame(tk.Frame):
             btn.pack(pady=8)
 
 
-class BeginGameFrame(tk.Frame):
+class GameSelectionFrame(tk.Frame):
+    def __init__(self, app):
+        super().__init__(app, bg=AppSettings.get_background_color())
+        base_font = AppSettings.get_base_font_size()
+        fg = AppSettings.get_foreground_color()
+        bg = AppSettings.get_background_color()
+
+        title = tk.Label(self, text="Select a Game", font=("Arial", 24, "bold"), fg=fg, bg=bg)
+        title.pack(pady=(24, 12))
+
+        subtitle = tk.Label(
+            self,
+            text="More games coming soon!",
+            font=("Arial", max(base_font - 2, 10)),
+            fg=fg,
+            bg=bg,
+        )
+        subtitle.pack(pady=(0, 20))
+
+        games_wrap = tk.Frame(self, bg=bg)
+        games_wrap.pack(expand=True)
+
+        balloon_btn = tk.Button(
+            games_wrap,
+            text="Balloon Game",
+            font=("Arial", base_font),
+            width=18,
+            command=app.show_balloon_game,
+        )
+        balloon_btn.pack(pady=8)
+
+        back_btn = tk.Button(
+            self,
+            text="Back to Menu",
+            font=("Arial", max(base_font - 2, 10)),
+            command=app.show_main_menu,
+        )
+        back_btn.pack(pady=(0, 20))
+
+
+class BalloonGameFrame(tk.Frame):
     def __init__(self, app):
         super().__init__(app, bg=AppSettings.get_background_color())
         self.app = app
