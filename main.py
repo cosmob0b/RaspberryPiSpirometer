@@ -127,6 +127,58 @@ class YFS201CGPIOReader:
         return flow_lpm
 
 
+class ArduinoSerialFlowReader:
+    """Read line-based flow values from an Arduino over serial."""
+
+    def __init__(self, serial_port, baud_rate=115200, timeout=0.1):
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.timeout = timeout
+        self._serial = None
+        self._last_value = 0.0
+
+    def start(self):
+        try:
+            import serial  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "pyserial is required. Install with: pip install pyserial"
+            ) from exc
+
+        self._serial = serial.Serial(self.serial_port, self.baud_rate, timeout=self.timeout)
+        self._serial.reset_input_buffer()
+
+    def stop(self):
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+
+    def read_flow_lpm(self, sample_seconds=0.5):
+        if self._serial is None:
+            return self._last_value
+
+        deadline = time.time() + sample_seconds
+        latest = self._last_value
+
+        while time.time() < deadline:
+            raw = self._serial.readline()
+            if not raw:
+                continue
+            text = raw.decode("utf-8", errors="ignore").strip()
+            if not text:
+                continue
+            try:
+                latest = max(float(text), 0.0)
+            except ValueError:
+                continue
+
+        self._last_value = latest
+        return latest
+
+
 class BalloonCanvas(tk.Canvas):
     def __init__(self, master, **kwargs):
         super().__init__(master, highlightthickness=0, **kwargs)
@@ -157,7 +209,7 @@ class BalloonCanvas(tk.Canvas):
 
 
 class MainApp(tk.Tk):
-    def __init__(self, gpio_pin=17, sample_window=0.5):
+    def __init__(self, gpio_pin=17, sample_window=0.5, serial_port="/dev/ttyACM0", baud_rate=115200):
         super().__init__()
         self.title("My Game Menu")
         self.set_window_size()
@@ -167,6 +219,8 @@ class MainApp(tk.Tk):
 
         self.gpio_pin = gpio_pin
         self.sample_window = sample_window
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
 
         self.show_main_menu()
 
@@ -194,6 +248,9 @@ class MainApp(tk.Tk):
 
     def show_balloon_game(self):
         self.show_frame(BalloonGameFrame)
+
+    def show_balloon_game_arduino(self):
+        self.show_frame(ArduinoBalloonGameFrame)
 
     def show_history(self):
         self.show_frame(HistoryFrame)
@@ -239,7 +296,7 @@ class GameSelectionFrame(tk.Frame):
 
         subtitle = tk.Label(
             self,
-            text="More games coming soon!",
+            text="Choose a flow input mode",
             font=("Arial", max(base_font - 2, 10)),
             fg=fg,
             bg=bg,
@@ -257,6 +314,15 @@ class GameSelectionFrame(tk.Frame):
             command=app.show_balloon_game,
         )
         balloon_btn.pack(pady=8)
+
+        arduino_balloon_btn = tk.Button(
+            games_wrap,
+            text="Balloon Game (Arduino Serial)",
+            font=("Arial", base_font),
+            width=24,
+            command=app.show_balloon_game_arduino,
+        )
+        arduino_balloon_btn.pack(pady=8)
 
         back_btn = tk.Button(
             self,
@@ -355,6 +421,96 @@ class BalloonGameFrame(tk.Frame):
         if self.gpio_reader is not None:
             self.gpio_reader.stop()
             self.gpio_reader = None
+
+
+class ArduinoBalloonGameFrame(tk.Frame):
+    def __init__(self, app):
+        super().__init__(app, bg=AppSettings.get_background_color())
+        self.app = app
+        self.running = True
+        self.serial_reader = None
+
+        self.last_flow_lpm = None
+        self.inflation_level = 0.0
+
+        base_font = AppSettings.get_base_font_size()
+        fg = AppSettings.get_foreground_color()
+        bg = AppSettings.get_background_color()
+
+        self.status_label = tk.Label(
+            self,
+            text=f"Arduino serial: {app.serial_port} @ {app.baud_rate}",
+            font=("Arial", base_font, "bold"),
+            fg=fg,
+            bg=bg,
+        )
+        self.status_label.pack(pady=(16, 8))
+
+        self.balloon = BalloonCanvas(self, bg=bg)
+        self.balloon.pack(fill="both", expand=True, padx=16, pady=8)
+
+        self.score_label = tk.Label(self, text="Flow: 0.00 L/min", font=("Arial", max(base_font - 2, 10)), fg=fg, bg=bg)
+        self.score_label.pack(pady=8)
+
+        back_button = tk.Button(self, text="Back to Menu", font=("Arial", max(base_font - 2, 10)), command=self.back_to_menu)
+        back_button.pack(pady=(0, 16))
+
+        self.start_serial_listener()
+
+    def destroy(self):
+        self.running = False
+        self.close_inputs()
+        super().destroy()
+
+    def back_to_menu(self):
+        self.running = False
+        self.close_inputs()
+        self.app.show_main_menu()
+
+    def start_serial_listener(self):
+        thread = threading.Thread(target=self.serial_loop, name="Arduino-Serial-Listener", daemon=True)
+        thread.start()
+
+    def serial_loop(self):
+        try:
+            self.serial_reader = ArduinoSerialFlowReader(self.app.serial_port, self.app.baud_rate, timeout=0.1)
+            self.serial_reader.start()
+            while self.running:
+                flow_lpm = self.serial_reader.read_flow_lpm(sample_seconds=self.app.sample_window)
+                self.app.after(0, self.handle_flow_reading, flow_lpm)
+        except Exception as exc:
+            print(f"Serial listener error: {exc}")
+            self.app.after(0, lambda: self.status_label.configure(text=f"Serial error: {exc}"))
+        finally:
+            self.close_inputs()
+
+    def handle_flow_reading(self, flow_lpm):
+        self.score_label.configure(text=f"Flow: {flow_lpm:.2f} L/min")
+
+        if self.last_flow_lpm is None:
+            self.last_flow_lpm = flow_lpm
+            return
+
+        delta = flow_lpm - self.last_flow_lpm
+
+        if delta > 0.02:
+            step = min(0.12, 0.01 + (delta * 0.04))
+            self.inflation_level = min(1.0, self.inflation_level + step)
+            self.status_label.configure(text="Serial flow increasing → balloon inflating")
+        elif delta < -0.02:
+            step = min(0.12, 0.01 + (abs(delta) * 0.04))
+            self.inflation_level = max(0.0, self.inflation_level - step)
+            self.status_label.configure(text="Serial flow decreasing → balloon deflating")
+        else:
+            self.status_label.configure(text="Serial flow steady")
+
+        self.balloon.set_inflation_level(self.inflation_level)
+        self.last_flow_lpm = flow_lpm
+
+    def close_inputs(self):
+        if self.serial_reader is not None:
+            self.serial_reader.stop()
+            self.serial_reader = None
 
 
 class HistoryFrame(tk.Frame):
@@ -465,7 +621,7 @@ class SettingsFrame(tk.Frame):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Balloon game with YF-S201C GPIO flow input")
+    parser = argparse.ArgumentParser(description="Balloon game with GPIO and Arduino serial flow input")
     parser.add_argument("--gpio-pin", type=int, default=17, help="BCM GPIO pin for YF-S201C output (default: 17)")
     parser.add_argument(
         "--sample-window",
@@ -473,10 +629,27 @@ def parse_args():
         default=0.5,
         help="Seconds per flow sample. Lower is more responsive, higher is smoother (default: 0.5)",
     )
+    parser.add_argument(
+        "--serial-port",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Arduino serial device path (default: /dev/ttyACM0)",
+    )
+    parser.add_argument(
+        "--baud-rate",
+        type=int,
+        default=115200,
+        help="Arduino serial baud rate (default: 115200)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    app = MainApp(gpio_pin=args.gpio_pin, sample_window=args.sample_window)
+    app = MainApp(
+        gpio_pin=args.gpio_pin,
+        sample_window=args.sample_window,
+        serial_port=args.serial_port,
+        baud_rate=args.baud_rate,
+    )
     app.mainloop()
