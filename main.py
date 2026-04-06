@@ -10,10 +10,25 @@ from tkinter import messagebox
 
 # Gameplay constants (Arduino serial is authoritative gameplay input)
 MAX_GAME_VOLUME_LITERS = 2.0
-VOLUME_DIRECTION_EPSILON = 0.01
 TARGET_MIN_LEVEL = 0.15
 TARGET_MAX_LEVEL = 0.85
 TARGET_TOLERANCE = 0.06
+TARGET_BLOW_START_MIN = 0.20
+TARGET_BLOW_START_MAX = 0.35
+TARGET_BLOW_LEVEL_MIN = 0.55
+TARGET_BLOW_LEVEL_MAX = 0.85
+TARGET_SUCK_START_MIN = 0.65
+TARGET_SUCK_START_MAX = 0.85
+TARGET_SUCK_LEVEL_MIN = 0.15
+TARGET_SUCK_LEVEL_MAX = 0.45
+TARGET_MIN_RPM_MIN = 130
+TARGET_MIN_RPM_MAX = 210
+DIRECTION_DELTA_NEUTRAL = 0.008
+DIRECTION_DELTA_STRONG = 0.014
+DIRECTION_EMA_ALPHA = 0.45
+DIRECTION_CONFIRM_TICKS = 2
+DISPLAY_LEVEL_ALPHA = 0.20
+DISPLAY_REDRAW_DEADBAND = 0.002
 
 
 def clamp(value, low, high):
@@ -85,30 +100,11 @@ class AppSettings:
 
 
 class GameHistory:
-    scores = []
     target_records = []
-
-    @classmethod
-    def add_score(cls, score):
-        cls.scores.append(score)
 
     @classmethod
     def add_target_record(cls, record):
         cls.target_records.append(record)
-
-    @classmethod
-    def format_scores(cls):
-        sections = []
-        if cls.scores:
-            lines = ["Classic Scores:"]
-            for i, score in enumerate(cls.scores, start=1):
-                lines.append(f"#{i}: {score} points")
-            sections.append("\n".join(lines))
-        else:
-            sections.append("Classic Scores:\nNo scores recorded yet.")
-
-        sections.append(cls.format_target_records())
-        return "\n\n".join(sections)
 
     @classmethod
     def format_target_records(cls):
@@ -120,11 +116,12 @@ class GameHistory:
             lines.append(
                 f"#{i} [{record['timestamp']}]: Direction {record['direction']} | "
                 f"Target Vol {record['target_volume_level']:.2f} ({record['target_volume_liters']:.2f} L) | "
+                f"Min RPM {record['minimum_rpm']:.0f} | "
                 f"Success Vol {record['success_volume_liters']:.2f} L | "
+                f"Success RPM {record['success_rpm']:.1f} | "
                 f"Peak RPM {record['peak_rpm']:.1f}"
             )
             lines.append(
-                f"    RPM samples: {record['rpm_samples']} | "
                 f"Pulses@Success: {record['success_total_pulses']}"
             )
         return "\n".join(lines)
@@ -134,41 +131,44 @@ class TargetSession:
     def __init__(self, tolerance=TARGET_TOLERANCE):
         self.tolerance = tolerance
         self.target_direction = "blow"
-        self.start_volume_level = 0.5
+        self.visual_start_level = 0.5
         self.target_volume_level = 0.5
+        self.minimum_rpm = float(TARGET_MIN_RPM_MIN)
         self.peak_rpm = 0.0
-        self.rpm_samples = []
         self.goal_met = False
         self.success_volume_liters = 0.0
+        self.success_rpm = 0.0
         self.success_total_pulses = 0
 
     def spawn_new_target(self, min_level=TARGET_MIN_LEVEL, max_level=TARGET_MAX_LEVEL):
         self.target_direction = random.choice(["blow", "suck"])
 
         if self.target_direction == "blow":
-            self.start_volume_level = random.uniform(0.20, 0.35)
-            self.target_volume_level = random.uniform(0.55, min(0.85, max_level))
+            self.visual_start_level = random.uniform(TARGET_BLOW_START_MIN, TARGET_BLOW_START_MAX)
+            self.target_volume_level = random.uniform(TARGET_BLOW_LEVEL_MIN, min(TARGET_BLOW_LEVEL_MAX, max_level))
         else:
-            self.start_volume_level = random.uniform(0.65, 0.85)
-            self.target_volume_level = random.uniform(max(0.15, min_level), 0.45)
+            self.visual_start_level = random.uniform(TARGET_SUCK_START_MIN, TARGET_SUCK_START_MAX)
+            self.target_volume_level = random.uniform(max(TARGET_SUCK_LEVEL_MIN, min_level), TARGET_SUCK_LEVEL_MAX)
 
-        self.start_volume_level = clamp(self.start_volume_level, min_level, max_level)
+        self.visual_start_level = clamp(self.visual_start_level, min_level, max_level)
         self.target_volume_level = clamp(self.target_volume_level, min_level, max_level)
-        self.rpm_samples = []
+        self.minimum_rpm = float(random.randint(TARGET_MIN_RPM_MIN, TARGET_MIN_RPM_MAX))
         self.peak_rpm = 0.0
         self.goal_met = False
         self.success_volume_liters = 0.0
+        self.success_rpm = 0.0
         self.success_total_pulses = 0
 
     def check_goal(self, inferred_direction, volume_level, volume_liters, rpm, total_pulses):
-        self.rpm_samples.append(round(rpm, 1))
         self.peak_rpm = max(self.peak_rpm, rpm)
         in_target = abs(volume_level - self.target_volume_level) <= self.tolerance
         direction_ok = inferred_direction == self.target_direction
+        rpm_ok = rpm >= self.minimum_rpm
 
-        self.goal_met = in_target and direction_ok
+        self.goal_met = in_target and direction_ok and rpm_ok
         if self.goal_met:
             self.success_volume_liters = volume_liters
+            self.success_rpm = rpm
             self.success_total_pulses = total_pulses
 
         return self.goal_met
@@ -179,9 +179,10 @@ class TargetSession:
             "direction": "Blow" if self.target_direction == "blow" else "Suck",
             "target_volume_level": self.target_volume_level,
             "target_volume_liters": self.target_volume_level * MAX_GAME_VOLUME_LITERS,
+            "minimum_rpm": self.minimum_rpm,
             "success_volume_liters": self.success_volume_liters,
+            "success_rpm": self.success_rpm,
             "peak_rpm": self.peak_rpm,
-            "rpm_samples": ", ".join(f"{x:.1f}" for x in self.rpm_samples) if self.rpm_samples else "none",
             "success_total_pulses": self.success_total_pulses,
         }
 
@@ -397,12 +398,17 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.serial_reader = None
 
         self.previous_volume_liters = None
+        self.smoothed_volume_delta = 0.0
+        self.pending_direction = "neutral"
+        self.pending_direction_ticks = 0
         self.live_direction = "neutral"
         self.current_volume_liters = 0.0
         self.current_volume_level = 0.0
+        self.display_volume_level = 0.0
 
         self.target_session = TargetSession()
         self.target_session.spawn_new_target()
+        self.display_volume_level = self.target_session.visual_start_level
 
         base_font = AppSettings.get_base_font_size()
         self.fg = AppSettings.get_foreground_color()
@@ -419,7 +425,7 @@ class ArduinoTargetGameFrame(tk.Frame):
 
         self.balloon = BalloonCanvas(self, bg=bg)
         self.balloon.set_goal_level(self.target_session.target_volume_level)
-        self.balloon.set_volume_level(self.target_session.start_volume_level)
+        self.balloon.set_volume_level(self.target_session.visual_start_level)
         self.balloon.pack(fill="both", expand=True, padx=16, pady=8)
 
         self.game_label = tk.Label(
@@ -436,6 +442,9 @@ class ArduinoTargetGameFrame(tk.Frame):
 
         self.target_direction_label = tk.Label(self, font=("Arial", max(base_font - 3, 10)), fg=self.fg, bg=bg)
         self.target_direction_label.pack(pady=(0, 4))
+
+        self.target_rpm_label = tk.Label(self, font=("Arial", max(base_font - 3, 10)), fg=self.fg, bg=bg)
+        self.target_rpm_label.pack(pady=(0, 4))
 
         self.direction_label = tk.Label(self, text="Live direction: Neutral", font=("Arial", max(base_font - 3, 10)), fg=self.fg, bg=bg)
         self.direction_label.pack(pady=(0, 4))
@@ -468,26 +477,59 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.app.show_main_menu()
 
     def update_goal_text(self):
+        target_liters = self.target_session.target_volume_level * MAX_GAME_VOLUME_LITERS
         self.goal_label.configure(
             text=(
-                f"Target volume: {self.target_session.target_volume_level:.2f} "
-                f"({self.target_session.target_volume_level * MAX_GAME_VOLUME_LITERS:.2f} L) "
+                f"Target volume: {target_liters:.2f} L "
+                f"(norm {self.target_session.target_volume_level:.2f}) "
                 f"± {self.target_session.tolerance:.2f}"
             )
         )
         direction_text = "Blow" if self.target_session.target_direction == "blow" else "Suck"
         self.target_direction_label.configure(text=f"Direction target: {direction_text}")
+        self.target_rpm_label.configure(text=f"Minimum RPM required: {self.target_session.minimum_rpm:.0f}")
 
     def infer_direction(self, current_volume_liters):
         if self.previous_volume_liters is None:
             return "neutral"
 
         delta = current_volume_liters - self.previous_volume_liters
-        if delta > VOLUME_DIRECTION_EPSILON:
-            return "blow"
-        if delta < -VOLUME_DIRECTION_EPSILON:
-            return "suck"
-        return "neutral"
+        self.smoothed_volume_delta = (DIRECTION_EMA_ALPHA * delta) + (
+            (1.0 - DIRECTION_EMA_ALPHA) * self.smoothed_volume_delta
+        )
+        abs_delta = abs(self.smoothed_volume_delta)
+
+        if abs_delta < DIRECTION_DELTA_NEUTRAL:
+            candidate = "neutral"
+        elif self.smoothed_volume_delta > DIRECTION_DELTA_STRONG:
+            candidate = "blow"
+        elif self.smoothed_volume_delta < -DIRECTION_DELTA_STRONG:
+            candidate = "suck"
+        else:
+            candidate = self.live_direction
+
+        if candidate == self.live_direction:
+            self.pending_direction = candidate
+            self.pending_direction_ticks = 0
+            return self.live_direction
+
+        if candidate == self.pending_direction:
+            self.pending_direction_ticks += 1
+        else:
+            self.pending_direction = candidate
+            self.pending_direction_ticks = 1
+
+        if self.pending_direction_ticks >= DIRECTION_CONFIRM_TICKS:
+            self.pending_direction_ticks = 0
+            return candidate
+        return self.live_direction
+
+    def reset_inference_state_for_new_target(self, current_sample_volume_liters):
+        self.smoothed_volume_delta = 0.0
+        self.pending_direction = "neutral"
+        self.pending_direction_ticks = 0
+        self.live_direction = "neutral"
+        self.previous_volume_liters = current_sample_volume_liters
 
     def start_serial_listener(self):
         threading.Thread(target=self.serial_loop, name="Arduino-Serial-Listener", daemon=True).start()
@@ -511,13 +553,21 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.current_volume_liters = sample.volume_liters
         self.current_volume_level = clamp(sample.volume_liters / MAX_GAME_VOLUME_LITERS, 0.0, 1.0)
         self.live_direction = inferred_direction
+        next_display_level = self.display_volume_level + (
+            DISPLAY_LEVEL_ALPHA * (self.current_volume_level - self.display_volume_level)
+        )
+        next_display_level = clamp(next_display_level, 0.0, 1.0)
 
         self.volume_label.configure(
             text=f"Current volume: {sample.volume_liters:.2f} L ({self.current_volume_level:.2f})"
         )
         self.rpm_label.configure(text=f"Current RPM: {sample.rpm:.1f}")
         self.direction_label.configure(text=f"Live direction: {inferred_direction.capitalize()}")
-        self.balloon.set_volume_level(self.current_volume_level)
+        if abs(next_display_level - self.display_volume_level) >= DISPLAY_REDRAW_DEADBAND:
+            self.display_volume_level = next_display_level
+            self.balloon.set_volume_level(self.display_volume_level)
+        else:
+            self.display_volume_level = next_display_level
         self.balloon.set_goal_level(self.target_session.target_volume_level)
 
         if self.target_session.check_goal(
@@ -530,16 +580,26 @@ class ArduinoTargetGameFrame(tk.Frame):
             GameHistory.add_target_record(self.target_session.record())
             self.status_label.configure(text="Target met! New target spawned.")
             self.target_session.spawn_new_target()
+            self.reset_inference_state_for_new_target(sample.volume_liters)
+            self.display_volume_level = self.target_session.visual_start_level
             self.balloon.set_goal_level(self.target_session.target_volume_level)
-            self.balloon.set_volume_level(self.target_session.start_volume_level)
+            self.balloon.set_volume_level(self.display_volume_level)
+            self.direction_label.configure(text="Live direction: Neutral")
             self.update_goal_text()
         else:
+            action_word = "Blow" if self.target_session.target_direction == "blow" else "Suck"
+            target_liters = self.target_session.target_volume_level * MAX_GAME_VOLUME_LITERS
             if self.target_session.target_direction == "blow":
-                self.status_label.configure(text="Blow to move live volume toward the target ring.")
+                self.status_label.configure(
+                    text=f"{action_word} to {target_liters:.2f} L at at least {self.target_session.minimum_rpm:.0f} RPM"
+                )
             else:
-                self.status_label.configure(text="Suck to move live volume toward the target ring.")
+                self.status_label.configure(
+                    text=f"{action_word} to {target_liters:.2f} L at at least {self.target_session.minimum_rpm:.0f} RPM"
+                )
 
-        self.previous_volume_liters = sample.volume_liters
+        if not self.target_session.goal_met:
+            self.previous_volume_liters = sample.volume_liters
 
     def close_inputs(self):
         if self.serial_reader is not None:
@@ -557,7 +617,7 @@ class HistoryFrame(tk.Frame):
         tk.Label(self, text="Game History & Data", font=("Arial", base_font, "bold"), fg=fg, bg=bg).pack(pady=(16, 8))
 
         text = tk.Text(self, height=14, wrap="word", font=("Arial", max(base_font - 2, 10)), fg=fg, bg=bg)
-        text.insert("1.0", GameHistory.format_scores())
+        text.insert("1.0", GameHistory.format_target_records())
         text.configure(state="disabled")
         text.pack(fill="both", expand=True, padx=16, pady=8)
 
