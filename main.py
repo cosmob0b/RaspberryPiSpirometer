@@ -101,10 +101,48 @@ class AppSettings:
 
 class GameHistory:
     target_records = []
+    directional_records = {
+        "blow": {"max_flow_rpm": 0.0, "best_volume_liters": 0.0, "success_rpm": 0.0, "best_volume_timestamp": None},
+        "suck": {"max_flow_rpm": 0.0, "best_volume_liters": 0.0, "success_rpm": 0.0, "best_volume_timestamp": None},
+    }
 
     @classmethod
     def add_target_record(cls, record):
         cls.target_records.append(record)
+
+    @classmethod
+    def update_directional_record(cls, direction_key, peak_rpm, final_volume_liters, success_rpm, timestamp):
+        if direction_key not in cls.directional_records:
+            return
+
+        current = cls.directional_records[direction_key]
+        current["max_flow_rpm"] = max(current["max_flow_rpm"], peak_rpm)
+        if final_volume_liters >= current["best_volume_liters"]:
+            current["best_volume_liters"] = final_volume_liters
+            current["success_rpm"] = success_rpm
+            current["best_volume_timestamp"] = timestamp
+
+    @classmethod
+    def format_directional_summary(cls):
+        lines = ["Directional Performance Summary:"]
+        direction_labels = {
+            "blow": "Blow / Exhale",
+            "suck": "Suck / Inhale",
+        }
+
+        for direction_key in ("blow", "suck"):
+            direction_data = cls.directional_records[direction_key]
+            lines.append(f"{direction_labels[direction_key]}:")
+            if direction_data["best_volume_timestamp"] is None:
+                lines.append("- No completed attempts recorded yet.")
+            else:
+                lines.append(f"- Max Flow Rate: {direction_data['max_flow_rpm']:.1f} RPM")
+                lines.append(f"- Best Volume: {direction_data['best_volume_liters']:.2f} L")
+                lines.append(f"- Best Volume Success RPM: {direction_data['success_rpm']:.1f}")
+                lines.append(f"- Best Volume Timestamp: {direction_data['best_volume_timestamp']}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip()
 
     @classmethod
     def format_target_records(cls):
@@ -114,17 +152,27 @@ class GameHistory:
         lines = ["Completed Targets:"]
         for i, record in enumerate(cls.target_records, start=1):
             lines.append(
-                f"#{i} [{record['timestamp']}]: Direction {record['direction']} | "
-                f"Target Vol {record['target_volume_level']:.2f} ({record['target_volume_liters']:.2f} L) | "
-                f"Min RPM {record['minimum_rpm']:.0f} | "
-                f"Success Vol {record['success_volume_liters']:.2f} L | "
-                f"Success RPM {record['success_rpm']:.1f} | "
-                f"Peak RPM {record['peak_rpm']:.1f}"
+                f"#{i} [{record['timestamp']}]"
             )
             lines.append(
-                f"Pulses@Success: {record['success_total_pulses']}"
+                f"  Direction: {record['direction']} | "
+                f"Target Vol: {record['target_volume_level']:.2f} ({record['target_volume_liters']:.2f} L) | "
+                f"Min RPM: {record['minimum_rpm']:.0f}"
             )
-        return "\n".join(lines)
+            lines.append(
+                f"  Success Vol: {record['success_volume_liters']:.2f} L | "
+                f"Success RPM: {record['success_rpm']:.1f} | "
+                f"Peak RPM: {record['peak_rpm']:.1f}"
+            )
+            lines.append(
+                f"  Pulses@Success: {record['success_total_pulses']}"
+            )
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    @classmethod
+    def format_full_history(cls):
+        return f"{cls.format_directional_summary()}\n\n{cls.format_target_records()}"
 
 
 class TargetSession:
@@ -577,7 +625,16 @@ class ArduinoTargetGameFrame(tk.Frame):
             rpm=sample.rpm,
             total_pulses=sample.total_pulses,
         ):
-            GameHistory.add_target_record(self.target_session.record())
+            record = self.target_session.record()
+            GameHistory.add_target_record(record)
+            direction_key = "blow" if self.target_session.target_direction == "blow" else "suck"
+            GameHistory.update_directional_record(
+                direction_key=direction_key,
+                peak_rpm=record["peak_rpm"],
+                final_volume_liters=record["success_volume_liters"],
+                success_rpm=record["success_rpm"],
+                timestamp=record["timestamp"],
+            )
             self.status_label.configure(text="Target met! New target spawned.")
             self.target_session.spawn_new_target()
             self.reset_inference_state_for_new_target(sample.volume_liters)
@@ -617,7 +674,7 @@ class HistoryFrame(tk.Frame):
         tk.Label(self, text="Game History & Data", font=("Arial", base_font, "bold"), fg=fg, bg=bg).pack(pady=(16, 8))
 
         text = tk.Text(self, height=14, wrap="word", font=("Arial", max(base_font - 2, 10)), fg=fg, bg=bg)
-        text.insert("1.0", GameHistory.format_target_records())
+        text.insert("1.0", GameHistory.format_full_history())
         text.configure(state="disabled")
         text.pack(fill="both", expand=True, padx=16, pady=8)
 
