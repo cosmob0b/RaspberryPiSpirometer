@@ -264,14 +264,22 @@ class ArduinoSerialLiveReader:
     @staticmethod
     def parse_live_line(text):
         parts = text.split(",")
-        if len(parts) != 4 or parts[0] != "LIVE":
+        if len(parts) == 4 and parts[0] == "LIVE":
+            payload = parts[1:]
+        elif len(parts) == 3:
+            # Accept raw triples as a compatibility format:
+            # total_pulses,volume_liters,rpm
+            payload = parts
+        elif len(parts) >= 4 and parts[0] in {"DATA", "SAMPLE"}:
+            payload = parts[1:4]
+        else:
             return None
 
         try:
             sample = ArduinoLiveSample(
-                total_pulses=int(parts[1]),
-                volume_liters=float(parts[2]),
-                rpm=float(parts[3]),
+                total_pulses=int(payload[0]),
+                volume_liters=float(payload[1]),
+                rpm=float(payload[2]),
             )
         except ValueError:
             return None
@@ -591,6 +599,8 @@ class ArduinoTargetGameFrame(tk.Frame):
                 sample = self.serial_reader.read_latest_sample(sample_seconds=self.app.sample_window)
                 if sample is not None:
                     self.app.after(0, self.handle_live_sample, sample)
+                elif self.running:
+                    self.app.after(0, lambda: self.status_label.configure(text="Waiting for LIVE sensor data..."))
         except Exception as exc:
             self.app.after(0, lambda: self.status_label.configure(text=f"Serial error: {exc}"))
         finally:
