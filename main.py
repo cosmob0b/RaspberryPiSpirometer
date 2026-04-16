@@ -243,6 +243,34 @@ class ArduinoSerialLiveReader:
         self.baud_rate = baud_rate
         self.timeout = timeout
         self._serial = None
+        self.active_serial_port = serial_port
+
+    @staticmethod
+    def detect_available_serial_ports():
+        try:
+            from serial.tools import list_ports  # type: ignore
+        except Exception:
+            return []
+        return [port.device for port in list_ports.comports()]
+
+    @classmethod
+    def resolve_serial_port(cls, requested_port):
+        available_ports = cls.detect_available_serial_ports()
+        if requested_port and requested_port.lower() != "auto":
+            return requested_port
+
+        preferred = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"]
+        for candidate in preferred:
+            if candidate in available_ports:
+                return candidate
+
+        for candidate in available_ports:
+            if candidate.startswith("/dev/ttyACM") or candidate.startswith("/dev/ttyUSB") or candidate.upper().startswith("COM"):
+                return candidate
+
+        if available_ports:
+            return available_ports[0]
+        return None
 
     def start(self):
         try:
@@ -250,7 +278,14 @@ class ArduinoSerialLiveReader:
         except Exception as exc:
             raise RuntimeError("pyserial is required. Install with: pip install pyserial") from exc
 
-        self._serial = serial.Serial(self.serial_port, self.baud_rate, timeout=self.timeout)
+        resolved_port = self.resolve_serial_port(self.serial_port)
+        if resolved_port is None:
+            raise RuntimeError(
+                "No serial device found. Plug in the Arduino/Elgato bridge and rerun with --serial-port <device>."
+            )
+
+        self.active_serial_port = resolved_port
+        self._serial = serial.Serial(resolved_port, self.baud_rate, timeout=self.timeout)
         self._serial.reset_input_buffer()
 
     def stop(self):
@@ -595,6 +630,12 @@ class ArduinoTargetGameFrame(tk.Frame):
         try:
             self.serial_reader = ArduinoSerialLiveReader(self.app.serial_port, self.app.baud_rate, timeout=0.1)
             self.serial_reader.start()
+            self.app.after(
+                0,
+                lambda: self.status_label.configure(
+                    text=f"Arduino serial: {self.serial_reader.active_serial_port} @ {self.app.baud_rate}"
+                ),
+            )
             while self.running:
                 sample = self.serial_reader.read_latest_sample(sample_seconds=self.app.sample_window)
                 if sample is not None:
@@ -791,8 +832,8 @@ def parse_args():
     parser.add_argument(
         "--serial-port",
         type=str,
-        default="/dev/ttyACM0",
-        help="Arduino serial device path (default: /dev/ttyACM0)",
+        default="auto",
+        help="Arduino serial device path, or 'auto' to detect (default: auto)",
     )
     parser.add_argument(
         "--baud-rate",
@@ -800,10 +841,24 @@ def parse_args():
         default=115200,
         help="Arduino serial baud rate (default: 115200)",
     )
+    parser.add_argument(
+        "--list-ports",
+        action="store_true",
+        help="List detected serial ports and exit",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.list_ports:
+        ports = ArduinoSerialLiveReader.detect_available_serial_ports()
+        if ports:
+            print("Detected serial ports:")
+            for port in ports:
+                print(f"- {port}")
+        else:
+            print("No serial ports detected.")
+        raise SystemExit(0)
     app = MainApp(sample_window=args.sample_window, serial_port=args.serial_port, baud_rate=args.baud_rate)
     app.mainloop()
