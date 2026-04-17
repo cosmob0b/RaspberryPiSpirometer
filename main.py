@@ -103,7 +103,7 @@ class GameHistory:
     target_records = []
     directional_records = {
         "blow": {"max_flow_rpm": 0.0, "best_volume_liters": 0.0, "success_rpm": 0.0, "best_volume_timestamp": None},
-        "suck": {"max_flow_rpm": 0.0, "best_volume_liters": 0.0, "success_rpm": 0.0, "best_volume_timestamp": None},
+        "inhale": {"max_flow_rpm": 0.0, "best_volume_liters": 0.0, "success_rpm": 0.0, "best_volume_timestamp": None},
     }
 
     @classmethod
@@ -126,11 +126,11 @@ class GameHistory:
     def format_directional_summary(cls):
         lines = ["Directional Performance Summary:"]
         direction_labels = {
-            "blow": "Blow / Exhale",
-            "suck": "Suck / Inhale",
+            "blow": "Exhale",
+            "inhale": "Inhale",
         }
 
-        for direction_key in ("blow", "suck"):
+        for direction_key in ("blow", "inhale"):
             direction_data = cls.directional_records[direction_key]
             lines.append(f"{direction_labels[direction_key]}:")
             if direction_data["best_volume_timestamp"] is None:
@@ -188,8 +188,8 @@ class TargetSession:
         self.success_rpm = 0.0
         self.success_total_pulses = 0
 
-    def spawn_new_target(self, min_level=TARGET_MIN_LEVEL, max_level=TARGET_MAX_LEVEL):
-        self.target_direction = random.choice(["blow", "suck"])
+    def spawn_new_target(self, min_level=TARGET_MIN_LEVEL, max_level=TARGET_MAX_LEVEL, forced_direction=None):
+        self.target_direction = forced_direction or random.choice(["blow", "suck"])
 
         if self.target_direction == "blow":
             self.visual_start_level = random.uniform(TARGET_BLOW_START_MIN, TARGET_BLOW_START_MAX)
@@ -224,7 +224,7 @@ class TargetSession:
     def record(self):
         return {
             "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "direction": "Blow" if self.target_direction == "blow" else "Suck",
+            "direction": "Exhale" if self.target_direction == "blow" else "Inhale",
             "target_volume_level": self.target_volume_level,
             "target_volume_liters": self.target_volume_level * MAX_GAME_VOLUME_LITERS,
             "minimum_rpm": self.minimum_rpm,
@@ -499,7 +499,9 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.display_volume_level = 0.0
 
         self.target_session = TargetSession()
-        self.target_session.spawn_new_target()
+        self.trial_directions = ["blow", "suck", "blow"]
+        self.trial_index = 0
+        self.target_session.spawn_new_target(forced_direction=self.trial_directions[self.trial_index])
         self.display_volume_level = self.target_session.visual_start_level
 
         base_font = AppSettings.get_base_font_size()
@@ -551,7 +553,16 @@ class ArduinoTargetGameFrame(tk.Frame):
             fg=self.fg,
             bg=bg,
         )
-        self.volume_label.pack(pady=(0, 8))
+        self.volume_label.pack(pady=(0, 2))
+
+        self.total_volume_label = tk.Label(
+            self,
+            text="Elgato total volume: 0.00 L",
+            font=("Arial", max(base_font - 2, 10)),
+            fg=self.fg,
+            bg=bg,
+        )
+        self.total_volume_label.pack(pady=(0, 8))
 
         tk.Button(self, text="Back to Menu", font=("Arial", max(base_font - 2, 10)), command=self.back_to_menu).pack(pady=(0, 16))
 
@@ -577,7 +588,7 @@ class ArduinoTargetGameFrame(tk.Frame):
                 f"± {self.target_session.tolerance:.2f}"
             )
         )
-        direction_text = "Blow" if self.target_session.target_direction == "blow" else "Suck"
+        direction_text = "Exhale" if self.target_session.target_direction == "blow" else "Inhale"
         self.target_direction_label.configure(text=f"Direction target: {direction_text}")
         self.target_rpm_label.configure(text=f"Minimum RPM required: {self.target_session.minimum_rpm:.0f}")
 
@@ -623,6 +634,29 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.live_direction = "neutral"
         self.previous_volume_liters = current_sample_volume_liters
 
+    def advance_to_next_trial(self, current_sample_volume_liters, completed_record):
+        completed_trial_number = self.trial_index + 1
+        self.trial_index += 1
+        self.status_label.configure(
+            text=(
+                f"Trial {completed_trial_number}/3 complete ({completed_record['direction']}). "
+                f"Elgato total volume: {completed_record['success_volume_liters']:.2f} L"
+            )
+        )
+
+        if self.trial_index >= len(self.trial_directions):
+            self.trial_index = 0
+            self.status_label.configure(text="3-trial set complete (Exhale → Inhale → Exhale). Starting over.")
+
+        next_direction = self.trial_directions[self.trial_index]
+        self.target_session.spawn_new_target(forced_direction=next_direction)
+        self.reset_inference_state_for_new_target(current_sample_volume_liters)
+        self.display_volume_level = self.target_session.visual_start_level
+        self.balloon.set_goal_level(self.target_session.target_volume_level)
+        self.balloon.set_volume_level(self.display_volume_level)
+        self.direction_label.configure(text="Live direction: Neutral")
+        self.update_goal_text()
+
     def start_serial_listener(self):
         threading.Thread(target=self.serial_loop, name="Arduino-Serial-Listener", daemon=True).start()
 
@@ -661,13 +695,12 @@ class ArduinoTargetGameFrame(tk.Frame):
         self.volume_label.configure(
             text=f"Current volume: {sample.volume_liters:.2f} L ({self.current_volume_level:.2f})"
         )
+        self.total_volume_label.configure(text=f"Elgato total volume: {sample.volume_liters:.2f} L")
         self.rpm_label.configure(text=f"Current RPM: {sample.rpm:.1f}")
-        self.direction_label.configure(text=f"Live direction: {inferred_direction.capitalize()}")
-        if abs(next_display_level - self.display_volume_level) >= DISPLAY_REDRAW_DEADBAND:
-            self.display_volume_level = next_display_level
-            self.balloon.set_volume_level(self.display_volume_level)
-        else:
-            self.display_volume_level = next_display_level
+        friendly_direction = "Exhale" if inferred_direction == "blow" else "Inhale" if inferred_direction == "suck" else "Neutral"
+        self.direction_label.configure(text=f"Live direction: {friendly_direction}")
+        self.display_volume_level = next_display_level
+        self.balloon.set_volume_level(self.display_volume_level)
         self.balloon.set_goal_level(self.target_session.target_volume_level)
 
         if self.target_session.check_goal(
@@ -679,7 +712,7 @@ class ArduinoTargetGameFrame(tk.Frame):
         ):
             record = self.target_session.record()
             GameHistory.add_target_record(record)
-            direction_key = "blow" if self.target_session.target_direction == "blow" else "suck"
+            direction_key = "blow" if self.target_session.target_direction == "blow" else "inhale"
             GameHistory.update_directional_record(
                 direction_key=direction_key,
                 peak_rpm=record["peak_rpm"],
@@ -687,25 +720,16 @@ class ArduinoTargetGameFrame(tk.Frame):
                 success_rpm=record["success_rpm"],
                 timestamp=record["timestamp"],
             )
-            self.status_label.configure(text="Target met! New target spawned.")
-            self.target_session.spawn_new_target()
-            self.reset_inference_state_for_new_target(sample.volume_liters)
-            self.display_volume_level = self.target_session.visual_start_level
-            self.balloon.set_goal_level(self.target_session.target_volume_level)
-            self.balloon.set_volume_level(self.display_volume_level)
-            self.direction_label.configure(text="Live direction: Neutral")
-            self.update_goal_text()
+            self.advance_to_next_trial(sample.volume_liters, record)
         else:
-            action_word = "Blow" if self.target_session.target_direction == "blow" else "Suck"
+            action_word = "Exhale" if self.target_session.target_direction == "blow" else "Inhale"
             target_liters = self.target_session.target_volume_level * MAX_GAME_VOLUME_LITERS
-            if self.target_session.target_direction == "blow":
-                self.status_label.configure(
-                    text=f"{action_word} to {target_liters:.2f} L at at least {self.target_session.minimum_rpm:.0f} RPM"
+            self.status_label.configure(
+                text=(
+                    f"Trial {self.trial_index + 1}/3: {action_word} to {target_liters:.2f} L "
+                    f"at at least {self.target_session.minimum_rpm:.0f} RPM"
                 )
-            else:
-                self.status_label.configure(
-                    text=f"{action_word} to {target_liters:.2f} L at at least {self.target_session.minimum_rpm:.0f} RPM"
-                )
+            )
 
         if not self.target_session.goal_met:
             self.previous_volume_liters = sample.volume_liters
